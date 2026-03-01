@@ -1,8 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import ytdl from "@distube/ytdl-core";
+import { Innertube } from "youtubei.js";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+function extractVideoId(url: string): string | null {
+  const patterns = [
+    /[?&]v=([^&\n?#]+)/,
+    /youtu\.be\/([^&\n?#]+)/,
+    /youtube\.com\/shorts\/([^&\n?#]+)/,
+    /youtube\.com\/embed\/([^&\n?#]+)/,
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -10,53 +24,87 @@ export async function GET(req: NextRequest) {
   const itag = searchParams.get("itag");
 
   if (!url || !itag) {
-    return NextResponse.json({ error: "URL과 화질 정보가 필요합니다." }, { status: 400 });
+    return NextResponse.json(
+      { error: "URL과 화질 정보가 필요합니다." },
+      { status: 400 }
+    );
   }
 
-  if (!ytdl.validateURL(url)) {
-    return NextResponse.json({ error: "올바른 YouTube URL이 아닙니다." }, { status: 400 });
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+    return NextResponse.json(
+      { error: "올바른 YouTube URL이 아닙니다." },
+      { status: 400 }
+    );
   }
 
   try {
-    const info = await ytdl.getInfo(url);
-    const format = info.formats.find((f) => f.itag === parseInt(itag));
+    const yt = await Innertube.create({ retrieve_player: true });
+    const info = await yt.getBasicInfo(videoId, "WEB");
 
-    if (!format) {
-      return NextResponse.json({ error: "선택한 화질을 찾을 수 없습니다." }, { status: 404 });
+    const streamingData = info.streaming_data;
+    if (!streamingData) throw new Error("No streaming data");
+
+    const allFormats = [
+      ...(streamingData.formats ?? []),
+      ...(streamingData.adaptive_formats ?? []),
+    ];
+
+    const selectedFormat = allFormats.find((f) => f.itag === parseInt(itag));
+    if (!selectedFormat) {
+      return NextResponse.json(
+        { error: "선택한 화질을 찾을 수 없습니다." },
+        { status: 404 }
+      );
     }
 
-    const title = info.videoDetails.title
-      .replace(/[^\w\s가-힣]/gi, "")
+    // Get the download URL (decipher if needed)
+    const downloadUrl: string =
+      selectedFormat.url ??
+      (selectedFormat as any).decipher(yt.session.player);
+
+    if (!downloadUrl) {
+      return NextResponse.json(
+        { error: "다운로드 URL을 생성할 수 없습니다." },
+        { status: 500 }
+      );
+    }
+
+    const title = (info.basic_info.title ?? "video")
+      .replace(/[<>:"/\\|?*]/g, "")
       .trim()
       .replace(/\s+/g, "_");
 
-    const ext = format.hasVideo ? "mp4" : "mp3";
+    const mime = selectedFormat.mime_type ?? "";
+    const hasVideo = mime.startsWith("video");
+    const ext = hasVideo ? "mp4" : "webm";
     const filename = encodeURIComponent(`${title}.${ext}`);
 
-    const stream = ytdl.downloadFromInfo(info, { format });
-
-    const readable = new ReadableStream({
-      start(controller) {
-        stream.on("data", (chunk: Buffer) => controller.enqueue(chunk));
-        stream.on("end", () => controller.close());
-        stream.on("error", (err: Error) => controller.error(err));
-      },
-      cancel() {
-        stream.destroy();
+    // Proxy stream from YouTube → client
+    const ytRes = await fetch(downloadUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Referer: "https://www.youtube.com/",
+        Origin: "https://www.youtube.com",
       },
     });
 
-    const headers: Record<string, string> = {
-      "Content-Disposition": `attachment; filename*=UTF-8''${filename}`,
-      "Content-Type": format.mimeType?.split(";")[0] || "video/mp4",
-      "Transfer-Encoding": "chunked",
-    };
-
-    if (format.contentLength) {
-      headers["Content-Length"] = format.contentLength;
+    if (!ytRes.ok || !ytRes.body) {
+      throw new Error(`YouTube fetch failed: ${ytRes.status}`);
     }
 
-    return new NextResponse(readable, { headers });
+    const headers: Record<string, string> = {
+      "Content-Disposition": `attachment; filename*=UTF-8''${filename}`,
+      "Content-Type": mime.split(";")[0] || "video/mp4",
+    };
+
+    const contentLength =
+      ytRes.headers.get("content-length") ??
+      (selectedFormat as any).content_length?.toString();
+    if (contentLength) headers["Content-Length"] = contentLength;
+
+    return new NextResponse(ytRes.body, { headers });
   } catch (err) {
     console.error("download error:", err);
     return NextResponse.json(
