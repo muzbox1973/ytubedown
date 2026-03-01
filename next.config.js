@@ -2,7 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   experimental: {
-    serverComponentsExternalPackages: ["@distube/ytdl-core"],
+    serverComponentsExternalPackages: ["youtubei.js"],
   },
 };
 
